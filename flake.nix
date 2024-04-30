@@ -28,7 +28,6 @@
         ];
         buildInputs = with pkgs; [
           crate2nix
-          lua-language-server
           rust-analyzer-nightly
           fenix.complete.clippy
           fenix.complete.rustfmt
