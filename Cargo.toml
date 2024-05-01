@@ -4,15 +4,18 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bevy = { version = "0.13", features = ["bevy_scene"], default-features = false }
+bevy = { version = "0.13", features = [
+  "multi-threaded",
+], default-features = false }
 futures = "0.3.28"
-sqlx = { version = "0.7.3", features = ["runtime-tokio", "sqlite", "chrono"] }
+sqlx = { version = "0.7.3", features = ["runtime-async-std", "sqlite"] }
 ron = "0.8.1"
 serde = "1.0.189"
+tracing = "0.1.40"
 bevy_async_util = { git = "git+ssh://git@github.com/jrobsonchase/bevy_async_util" }
 
 [dev-dependencies]
-tokio = { version = "1.36.0", features = ["macros", "rt"] }
+tracing-test = "0.2.4"
 
-# [patch.'git+ssh://git@github.com/jrobsonchase/bevy_async_util']
-# bevy_async_util = { path = "../bevy_async_util" }
+[patch.'git+ssh://git@github.com/jrobsonchase/bevy_async_util']
+bevy_async_util = { path = "../bevy_async_util" }

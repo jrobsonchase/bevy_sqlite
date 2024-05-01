@@ -13,27 +13,31 @@
           inputs.fenix.overlays.default
         ];
       };
-      cargoWorkspace = pkgs.callPackage ./Cargo.nix {
-        buildRustCrateForPkgs = pkgs: with pkgs; buildRustCrate.override {
-          rustc = fenix.complete.rustc;
-          cargo = fenix.complete.cargo;
-        };
-      };
     in
     {
-      inherit cargoWorkspace;
       devShells.default = pkgs.mkShell {
-        inputsFrom = [
-          cargoWorkspace.rootCrate.build
-        ];
         buildInputs = with pkgs; [
-          crate2nix
           rust-analyzer-nightly
+          taplo
           fenix.complete.clippy
           fenix.complete.rustfmt
+          fenix.complete.cargo
+          fenix.complete.rustc
+          sqlx-cli
+          (symlinkJoin {
+            name = "sqlite";
+            paths = [
+              (writeShellScriptBin "sqlite3" ''
+                exec ${sqlite-interactive}/bin/sqlite3 -cmd "PRAGMA foreign_keys = on" -column -header "$@"
+              '')
+              sqlite-interactive
+            ];
+          })
         ];
         RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+        RUSTC_WRAPPR = "${pkgs.sccache}/bin/sccache";
         RUST_BACKTRACE = "true";
+        DATABASE_URL = "sqlite://base-db.sqlite";
       };
     });
 }

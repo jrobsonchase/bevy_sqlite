@@ -1,29 +1,67 @@
-use std::{
-    borrow::Cow,
-    fmt::Write,
-    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
+use std::sync::{
+    Arc,
+    RwLock,
+    RwLockReadGuard,
+    RwLockWriteGuard,
 };
 
 use bevy::{
     ecs::{
-        entity::{EntityHashMap, SceneEntityMapper},
-        system::SystemParam,
+        entity::EntityHashMap,
+        reflect::ReflectMapEntities,
+        system::{
+            Command,
+            SystemParam,
+        },
     },
     prelude::*,
-    reflect::DynamicTupleStruct,
-    scene::DynamicEntity,
-    utils::{HashMap, HashSet},
+    reflect::{
+        serde::{
+            TypedReflectDeserializer,
+            TypedReflectSerializer,
+        },
+        GetTypeRegistration,
+        TypeInfo,
+        TypeRegistration,
+        TypeRegistry,
+    },
+    tasks::{
+        block_on,
+        futures_lite::StreamExt,
+        IoTaskPool,
+        Task,
+    },
+    utils::HashMap,
 };
-use futures::prelude::*;
-use sqlx::{Acquire, Either, Pool, Sqlite, SqliteConnection, SqlitePool};
+use bevy_async_util::nohup::{
+    nohup,
+    NoHup,
+};
+use serde::de::DeserializeSeed;
+use sqlx::{
+    Pool,
+    Sqlite,
+    SqliteConnection,
+    SqlitePool,
+};
+use tracing::{
+    debug,
+    trace,
+    warn,
+};
 
-use super::{ser::*, DbEntity, Load};
-use crate::BoxError;
+use super::DbEntity;
+use crate::{
+    Creating,
+    LoadedEntity,
+    Loading,
+    PersistComponents,
+};
 
 /// The actual sqlite database connection.
 /// Most functionality expects it to be added to the `World` as a `Resource`.
 #[derive(Resource, Clone, Deref, DerefMut)]
-pub struct Db(Pool<Sqlite>);
+pub struct Db(pub Pool<Sqlite>);
 
 impl Db {
     pub fn connect_lazy(uri: &str) -> Result<Self, sqlx::Error> {
@@ -31,271 +69,487 @@ impl Db {
     }
 }
 
-#[derive(SystemParam)]
-pub struct SaveDb<'w> {
-    pub(crate) db: Res<'w, Db>,
-    pub(crate) type_registry: Res<'w, AppTypeRegistry>,
-    pub(crate) map: Res<'w, SharedDbEntityMap>,
-}
-
-#[derive(Clone)]
-pub struct SaveDbOwned {
-    pub(crate) db: Db,
-    pub(crate) type_registry: AppTypeRegistry,
-    pub(crate) map: SharedDbEntityMap,
-}
-
-impl From<&'_ World> for SaveDbOwned {
-    fn from(value: &'_ World) -> Self {
-        let db = SaveDbOwned {
-            db: value.resource::<Db>().clone(),
-            type_registry: value.resource::<AppTypeRegistry>().clone(),
-            map: value.resource::<SharedDbEntityMap>().clone(),
-        };
-        db
-    }
-}
-
 impl<'w> SaveDb<'w> {
-    pub fn to_owned(&self) -> SaveDbOwned {
-        SaveDbOwned {
-            db: self.db.clone(),
-            type_registry: self.type_registry.clone(),
-            map: self.map.clone(),
+    pub fn from_world(world: &'w World) -> Self {
+        SaveDb {
+            db: world.resource(),
+            db_world: world.resource(),
+            type_registry: world.resource(),
+            persisted: world.resource(),
+            map: world.resource(),
         }
     }
+}
 
-    pub fn add_mapping(&self, db_entity: DbEntity, world_entity: Entity) {
-        let mut map = self.map.write();
-        map.add_db_mapping(db_entity, world_entity);
-    }
-    pub fn remove_mapping(&self, world_entity: Entity) {
-        let mut map = self.map.write();
-        map.remove_db_mapping(world_entity);
-    }
-    pub fn db_entities(&self, entities: impl Iterator<Item = Entity>) -> Vec<(Entity, DbEntity)> {
-        let db = self.map.read();
-        entities
-            .filter_map(|e| db.db_entity(e).map(|d| (e, d)))
-            .collect()
+#[derive(Resource, Default, Clone)]
+pub struct DbWorld(pub(crate) Arc<RwLock<World>>);
+
+/// The collection of resources needed for most operations.
+///
+/// Publically, it only provides functionality to set up a new saved entity or
+/// to delete a saved entity.
+#[derive(Clone, Copy)]
+pub struct SaveDb<'w> {
+    pub db: &'w Db,
+    pub db_world: &'w DbWorld,
+    pub type_registry: &'w AppTypeRegistry,
+    pub persisted: &'w PersistComponents,
+    pub map: &'w SharedDbEntityMap,
+}
+
+impl<'w> From<SaveDb<'w>> for SaveDbOwned {
+    fn from(value: SaveDb<'w>) -> Self {
+        Self {
+            db: value.db.clone(),
+            db_world: value.db_world.clone(),
+            type_registry: value.type_registry.clone(),
+            persisted: value.persisted.clone(),
+            map: value.map.clone(),
+        }
     }
 }
 
 impl SaveDbOwned {
-    pub fn write_to_world(
-        &self,
-        mut ents: Vec<DynamicDbEntity>,
-    ) -> impl FnOnce(&mut World) + 'static {
-        let mappings = self.map.clone();
-        let scene = DynamicScene {
-            entities: ents
-                .iter_mut()
-                .map(|de| DynamicEntity {
-                    entity: de.entity.0,
-                    components: std::mem::take(&mut de.components),
-                })
-                .collect(),
-            ..Default::default()
-        };
-        move |world: &mut World| {
-            {
-                let mut map = mappings.write();
-                if let Err(error) = scene.write_to_world(world, &mut map.db_to_world) {
-                    warn!(?error, "failed to spawn entities");
-                }
-                map.update();
-            }
-            let map = mappings.read();
-            for entity in ents {
-                let db_entity = entity.entity;
-                let world_entity = map.world_entity(db_entity).unwrap();
-                debug!(?world_entity, ?db_entity, "loaded entity from database");
-                let mut entity_cmds = world.entity_mut(world_entity);
-                entity_cmds.remove::<Load>().insert(db_entity);
-                if let Some(db_parent) = entity.parent {
-                    let world_parent = map.world_entity(db_parent).unwrap();
-                    debug!(
-                        ?world_entity,
-                        ?world_parent,
-                        ?db_entity,
-                        ?db_parent,
-                        "setting loaded entity parent"
-                    );
-                    entity_cmds.set_parent(world_parent);
-                }
-            }
+    pub fn borrowed(&self) -> SaveDb {
+        SaveDb {
+            db: &self.db,
+            db_world: &self.db_world,
+            type_registry: &self.type_registry,
+            persisted: &self.persisted,
+            map: &self.map,
         }
     }
+}
 
-    pub async fn hydrate_entities(self) -> Result<impl FnOnce(&mut World), BoxError> {
-        let mut conn = self.db.acquire().await?;
-        let db_entities = sqlx::query!("select id from entity;")
-            .fetch(&mut *conn)
-            .map(|res| res.map(|r| DbEntity::from_index(r.id)))
-            .try_collect::<Vec<_>>()
+/// An owned version of [SaveDb].
+#[derive(Clone)]
+pub struct SaveDbOwned {
+    pub db: Db,
+    pub db_world: DbWorld,
+    pub type_registry: AppTypeRegistry,
+    pub persisted: PersistComponents,
+    pub map: SharedDbEntityMap,
+}
+
+unsafe impl<'w> SystemParam for SaveDb<'w> {
+    type State = ();
+    type Item<'world, 'state> = SaveDb<'world>;
+
+    fn init_state(
+        _world: &mut World,
+        _system_meta: &mut bevy::ecs::system::SystemMeta,
+    ) -> Self::State {
+    }
+
+    unsafe fn get_param<'world, 'state>(
+        _state: &'state mut Self::State,
+        _system_meta: &bevy::ecs::system::SystemMeta,
+        world: bevy::ecs::world::unsafe_world_cell::UnsafeWorldCell<'world>,
+        _change_tick: bevy::ecs::component::Tick,
+    ) -> Self::Item<'world, 'state> {
+        SaveDb::from_world(world.world())
+    }
+}
+
+unsafe impl<'w> SystemParam for SaveDbOwned {
+    type State = ();
+    type Item<'world, 'state> = SaveDbOwned;
+
+    fn init_state(
+        _world: &mut World,
+        _system_meta: &mut bevy::ecs::system::SystemMeta,
+    ) -> Self::State {
+    }
+
+    unsafe fn get_param<'world, 'state>(
+        _state: &'state mut Self::State,
+        _system_meta: &bevy::ecs::system::SystemMeta,
+        world: bevy::ecs::world::unsafe_world_cell::UnsafeWorldCell<'world>,
+        _change_tick: bevy::ecs::component::Tick,
+    ) -> Self::Item<'world, 'state> {
+        SaveDb::from_world(world.world()).into()
+    }
+}
+
+impl<'w> SaveDb<'w> {
+    pub(crate) fn init(world: &mut World) {
+        debug!("initializing mappings from db");
+        let db = world.resource::<Db>().clone();
+        let indices = block_on(async move {
+            let records = sqlx::query!(r#"select id from entity"#,).fetch(&*db);
+
+            records
+                .map(|v| v.map(|r| r.id))
+                .try_collect::<i64, _, Vec<i64>>()
+                .await
+        })
+        .expect("fetch entity ids");
+        let db_world = world.resource::<DbWorld>().clone();
+        let mut db_world = db_world.write();
+        let map = world.resource::<SharedDbEntityMap>().clone();
+        let mut map_mut = map.write();
+        let reserved = world.entities().reserve_entities(indices.len() as _);
+        for (i, world_entity) in reserved.enumerate() {
+            let db_entity = DbEntity::from_index(indices[i]);
+            map_mut.add_db_mapping(db_entity, world_entity);
+            db_world.get_or_spawn(db_entity.0).unwrap();
+        }
+        drop(map_mut);
+        debug!(
+            mappings = ?world.resource::<SharedDbEntityMap>().read(),
+            "created {} entity mappings", indices.len()
+        );
+    }
+
+    /// Delete an entity from the database.
+    ///
+    /// Detaches the task and returns a command that will remove the [DbEntity]
+    /// from the world Entity.
+    pub(crate) fn delete_entity(&self, entity: Entity) -> Option<Task<sqlx::Result<()>>> {
+        let db = self.db.clone();
+        let db_entity = self.remove_mapping(entity)?;
+        self.db_world.write().despawn(db_entity.0);
+        Some(IoTaskPool::get().spawn(async move {
+            let id = db_entity.to_index();
+            sqlx::query!(
+                r#"
+                            DELETE FROM entity WHERE id = ?
+                        "#,
+                id
+            )
+            .execute(&*db)
+            .await?;
+            sqlx::Result::<()>::Ok(())
+        }))
+    }
+
+    fn serialize_component(
+        &self,
+        value: &dyn Reflect,
+        registry: &TypeRegistry,
+    ) -> ron::Result<String> {
+        let serialized = ron::ser::to_string(&TypedReflectSerializer { value, registry })?;
+        Ok(serialized)
+    }
+
+    fn save_serialized_component(
+        &self,
+        idx: i64,
+        type_info: &'static TypeInfo,
+        serialized: String,
+    ) -> NoHup<Result<(), sqlx::Error>> {
+        let db = self.db.clone();
+        nohup(async move {
+            let mut tx = db.begin().await?;
+            save_serialized_component(&mut tx, idx, type_info, serialized).await?;
+            tx.commit().await
+        })
+    }
+
+    fn write_to_db_world<'d>(
+        &self,
+        db_world: &'d mut World,
+        db_entity: DbEntity,
+        value: &dyn Reflect,
+        registration: &TypeRegistration,
+        registry: &TypeRegistry,
+    ) -> Option<&'d dyn Reflect> {
+        let reflect_component = registration.data::<ReflectComponent>()?;
+        reflect_component.apply_or_insert(
+            &mut db_world.get_or_spawn(db_entity.0).unwrap(),
+            value,
+            &registry,
+        );
+        if let Some(map_entities) = registration.data::<ReflectMapEntities>() {
+            map_entities.map_entities(db_world, &mut self.map.write().world_to_db, &[db_entity.0]);
+        }
+
+        let value = reflect_component.reflect(db_world.entity(db_entity.0))?;
+
+        Some(value)
+    }
+
+    pub(crate) fn save_component<T: Component + GetTypeRegistration + Reflect>(
+        &self,
+        db_entity: DbEntity,
+        component: &T,
+    ) -> Option<NoHup<Result<(), sqlx::Error>>> {
+        let value = component as &dyn Reflect;
+        let type_info = T::get_type_registration().type_info();
+        let registry = self.type_registry.read();
+        let registration = registry.get(type_info.type_id())?;
+        let mut db_world = self.db_world.write();
+        let value =
+            self.write_to_db_world(&mut db_world, db_entity, value, registration, &registry)?;
+        let idx = db_entity.to_index();
+        let serialized = match self.serialize_component(value, &registry) {
+            Ok(s) => s,
+            Err(error) => {
+                warn!(
+                    ?db_entity,
+                    component = type_info.type_path(),
+                    %error,
+                    "failed to serialize component to save",
+                );
+                return None;
+            }
+        };
+        self.save_serialized_component(idx, type_info, serialized)
+            .into()
+    }
+
+    pub(crate) fn delete_component<T: Component + GetTypeRegistration>(
+        &self,
+        db_entity: DbEntity,
+    ) -> Task<sqlx::Result<()>> {
+        let idx = db_entity.to_index();
+        let reg = T::get_type_registration();
+        let type_path = reg.type_info().type_path();
+        let db = self.db.clone();
+        self.db_world.write().entity_mut(db_entity.0).remove::<T>();
+        IoTaskPool::get().spawn(async move {
+            let mut tx = db.begin().await?;
+            // TODO cache component dbids
+            let component_id = sqlx::query!(
+                r#"
+                    INSERT INTO component (name)
+                    VALUES (?)
+                    ON CONFLICT DO UPDATE SET name = excluded.name
+                    RETURNING id
+                "#,
+                type_path
+            )
+            .fetch_one(&mut *tx)
+            .await?
+            .id;
+
+            debug!(entity_id = idx, component_id, "deleting entity_component");
+
+            let res = sqlx::query!(
+                r#"
+                    DELETE FROM entity_component
+                    WHERE entity = ?
+                    AND component = ?
+                    RETURNING *
+                "#,
+                idx,
+                component_id,
+            )
+            .fetch_one(&mut *tx)
             .await?;
 
-        Ok(move |world: &mut World| {
-            let mut guard = self.map.write();
-            let DbEntityMap {
-                ref mut db_to_world,
-                ref mut world_to_db,
-            } = &mut *guard;
-
-            SceneEntityMapper::world_scope(db_to_world, world, |_, mapper| {
-                db_entities.into_iter().for_each(|db_ent| {
-                    world_to_db.insert(mapper.map_entity(db_ent.0), db_ent.0);
-                })
-            })
-        })
-    }
-
-    pub async fn autoload_entities(self) -> Result<impl FnOnce(&mut World), BoxError> {
-        let mut conn = self.db.acquire().await?;
-        let db_entities = sqlx::query! {
-          "SELECT ec.entity
-      FROM entity e, component c, entity_component ec
-      WHERE e.id = ec.entity
-      AND c.id = ec.component
-      AND c.name = 'bevy_sqlite::AutoLoad'"
-        }
-        .fetch(&mut *conn)
-        .map(|r| r.map(|r| DbEntity::from_index(r.entity)))
-        .try_collect::<Vec<_>>()
-        .await?;
-
-        let entities = self.load_entities(Some(&mut *conn), db_entities).await?;
-
-        Ok(move |world: &mut World| {
-            if !entities.is_empty() {
-                let db = SaveDbOwned::from(&*world);
-                debug!("writing {} entities to world", entities.len());
-                db.write_to_world(entities)(world)
-            } else {
-                debug!("nothing to autoload!");
-            }
-        })
-    }
-
-    pub async fn load_entities(
-        self,
-        conn: Option<&mut SqliteConnection>,
-        entities: Vec<DbEntity>,
-    ) -> Result<Vec<DynamicDbEntity>, BoxError> {
-        let mut acquired;
-        let conn = if let Some(conn) = conn {
-            conn
-        } else {
-            acquired = Some(self.db.acquire().await?);
-            acquired.as_mut().unwrap()
-        };
-
-        let mut seen = HashSet::<DbEntity>::new();
-        let mut to_load = vec![];
-
-        for db_entity in entities {
-            let db_id = db_entity.to_index();
-            let mut results = sqlx::query! {
-          "WITH RECURSIVE
-            children(id) as (values(?) union select e.id from entity e, children d where e.parent = d.id)
-          select id, parent from entity where entity.id in children",
-          db_id,
-        }
-        .fetch(&mut *conn);
-            while let Some(res) = results.try_next().await? {
-                let ent = DbEntity::from_index(res.id);
-                let parent = res.parent.map(DbEntity::from_index);
-
-                if !seen.contains(&ent) {
-                    debug!(?ent, "adding entity to load");
-                    to_load.push(DynamicDbEntity {
-                        entity: ent,
-                        parent,
-                        components: vec![],
-                    });
-                    seen.insert(ent);
-                }
-            }
-        }
-
-        for DynamicDbEntity {
-            entity, components, ..
-        } in &mut to_load
-        {
-            let serialized_components = fetch_entity(conn, *entity).await?;
-            let deserialized_components =
-                deserialize_entity(&self.type_registry, &serialized_components)?;
-            *components = deserialized_components;
-            debug!(entity=?entity, components=?components, "fetched entity");
-        }
-
-        Ok(to_load)
-    }
-    pub async fn delete_entities(self, entities: Vec<(Entity, DbEntity)>) -> Result<(), BoxError> {
-        if entities.is_empty() {
-            return Ok(());
-        }
-        let mut query = "DELETE FROM entity WHERE id IN (".to_string();
-        write!(&mut query, "{}", entities[0].1.to_index())?;
-        for entity in &entities[1..] {
-            write!(&mut query, ",{}", entity.1.to_index())?;
-        }
-        write!(&mut query, ")")?;
-        let mut conn = self.db.acquire().await?;
-        sqlx::query(&query).execute(&mut *conn).await?;
-        let mut map = self.map.write();
-        for entity in &entities {
-            map.remove_db_mapping(entity.0);
-        }
-        Ok(())
-    }
-    pub async fn save_entities(
-        self,
-        entities: Vec<DynamicEntity>,
-    ) -> Result<HashMap<Entity, DbEntity>, BoxError> {
-        let mut output = HashMap::new();
-        let mut tx = self.db.begin().await?;
-        for entity in entities {
-            let id = entity.entity;
-
-            let mut parent = None;
-            let components = entity
-                .components
-                .into_iter()
-                .filter_map(|c| match find_parent(c) {
-                    Either::Left(p) => {
-                        parent = Some(p);
-                        None
-                    }
-                    Either::Right(c) => Some(c),
-                })
-                .collect::<Vec<_>>();
-
-            let (db_entity, db_parent) = {
-                let read_map = self.map.read();
-                let parent = parent.and_then(|p| read_map.db_entity(p));
-                let entity = read_map.db_entity(entity.entity);
-                (entity, parent)
-            };
-
-            let components = serialize_components(&self.type_registry, &components)?;
-
             debug!(
-              entity = ?entity.entity,
-              ?db_entity,
-              ?db_parent,
-              ?components,
-              "saving entity",
+                entity = res.entity,
+                component = res.component,
+                "deleted entry from db"
             );
 
-            let db_entity = store_entity(&mut tx, db_entity, db_parent, &components).await?;
+            tx.commit().await?;
 
-            self.map.write().add_db_mapping(db_entity, id);
-            output.insert(id, db_entity);
-        }
-        tx.commit().await?;
-        Ok(output)
+            Ok(())
+        })
     }
+
+    pub fn load_entity(&self, entity: Entity) -> Option<Loading> {
+        self.map
+            .read()
+            .db_entity(entity)
+            .and_then(|db_entity| self.load_db_entity(db_entity))
+    }
+
+    pub fn load_db_entity(&self, db_entity: DbEntity) -> Option<Loading> {
+        let db = self.db.clone();
+        let db_world = self.db_world.clone();
+        let registry = self.type_registry.clone();
+        let idx = db_entity.to_index();
+        let task = IoTaskPool::get().spawn(async move {
+            let mut components = HashMap::new();
+
+            let results = sqlx::query!(
+                r#"
+                    SELECT c.name, ec.data
+                    FROM component c, entity_component ec
+                    WHERE ec.component = c.id
+                    AND ec.entity = ?
+                "#,
+                idx,
+            )
+            .fetch_all(&*db)
+            .await?;
+
+            let registry = registry.read();
+
+            let mut db_world = db_world.write();
+
+            for record in results {
+                let name = record.name;
+                let data = record.data;
+
+                let Some(registration) = registry.get_with_type_path(&name) else {
+                    warn!(name, "component not registered");
+                    continue;
+                };
+
+                let Some(component) = registration.data::<ReflectComponent>().cloned() else {
+                    warn!(name, "Component trait not reflected");
+                    continue;
+                };
+
+                let map_entities = registration.data::<ReflectMapEntities>().cloned();
+
+                let seed = TypedReflectDeserializer::new(registration, &registry);
+
+                let data = match ron::Deserializer::from_str(&data)
+                    .map_err(ron::Error::from)
+                    .and_then(|mut deserializer| seed.deserialize(&mut deserializer))
+                {
+                    Ok(de) => de,
+                    Err(error) => {
+                        warn!(%error, name, "error deserializing component");
+                        continue;
+                    }
+                };
+
+                component.apply_or_insert(
+                    &mut db_world.get_or_spawn(db_entity.0).unwrap(),
+                    &*data,
+                    &registry,
+                );
+
+                components.insert(name, (component, map_entities, data));
+            }
+
+            Ok(LoadedEntity {
+                db_entity,
+                components,
+            })
+        });
+        Some(Loading { task })
+    }
+
+    /// Save an entity to the database.
+    ///
+    /// This will also add the necessary components to populate its [DbEntity]
+    /// once allocated.
+    pub fn save_entity(&self, entity_ref: EntityRef) -> Creating {
+        debug!(world_entity = ?entity_ref.id(), "save_entity");
+        let world_entity = entity_ref.id();
+        let db_entity = self.map.read().db_entity(world_entity);
+        let db_entity = if db_entity.map(|e| e.to_index()).is_some() {
+            let db_entity = db_entity.unwrap();
+            db_entity
+        } else {
+            let mut db_world = self.db_world.write();
+            let db_entity = DbEntity(db_world.spawn_empty().id());
+            db_entity
+        };
+        self.map.write().add_db_mapping(db_entity, world_entity);
+
+        let registry = self.type_registry.read();
+        let mut db_world = self.db_world.write();
+        let mut components = HashMap::<&'static str, (&'static TypeInfo, String)>::new();
+        for registration in self
+            .persisted
+            .read()
+            .iter()
+            .filter_map(|id| registry.get(*id))
+        {
+            let type_info = registration.type_info();
+            let type_path = type_info.type_path();
+            let Some(reflect_component) = registration.data::<ReflectComponent>() else {
+                warn!(type_path, "persisted component not reflected");
+                continue;
+            };
+            let Some(value) = reflect_component.reflect(entity_ref) else {
+                continue;
+            };
+
+            let Some(value) =
+                self.write_to_db_world(&mut db_world, db_entity, value, registration, &registry)
+            else {
+                continue;
+            };
+
+            let serialized = match self.serialize_component(value, &registry) {
+                Ok(s) => s,
+                Err(error) => {
+                    warn!(%error, type_path, "failed to serialize component");
+                    continue;
+                }
+            };
+            components.insert(type_path, (type_info, serialized));
+        }
+
+        trace!(map = ?&*self.map.read());
+
+        let db = self.db.clone();
+        let task = IoTaskPool::get()
+            .spawn(async move {
+                let mut tx = db.begin().await?;
+                let idx = db_entity.to_index();
+                sqlx::query!(
+                    r#"
+                    INSERT INTO entity (id) VALUES (?)
+                    ON CONFLICT DO NOTHING
+                "#,
+                    idx,
+                )
+                .execute(&mut *tx)
+                .await?;
+
+                debug!(?db_entity, ?components, "saving components");
+                for (info, data) in components.into_values() {
+                    save_serialized_component(&mut tx, db_entity.to_index(), info, data).await?;
+                }
+
+                tx.commit().await?;
+                Ok(db_entity)
+            })
+            .into();
+
+        Creating { task }
+    }
+    pub(crate) fn remove_mapping(&self, world_entity: Entity) -> Option<DbEntity> {
+        let mut map = self.map.write();
+        map.remove_db_mapping(world_entity)
+    }
+}
+
+async fn save_serialized_component(
+    conn: &mut SqliteConnection,
+    idx: i64,
+    type_info: &'static TypeInfo,
+    serialized: String,
+) -> sqlx::Result<()> {
+    let type_path = type_info.type_path();
+    // TODO cache component dbids
+    let component_id = sqlx::query!(
+        r#"
+            INSERT INTO component (name)
+            VALUES (?)
+            ON CONFLICT DO UPDATE SET name = excluded.name
+            RETURNING id
+        "#,
+        type_path
+    )
+    .fetch_one(&mut *conn)
+    .await?
+    .id;
+
+    sqlx::query!(
+        r#"
+            INSERT INTO entity_component (entity, component, data)
+            VALUES (?, ?, ?)
+            ON CONFLICT DO
+            UPDATE SET data = excluded.data
+        "#,
+        idx,
+        component_id,
+        serialized,
+    )
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 #[derive(Resource, Default, Debug, Clone)]
@@ -304,242 +558,77 @@ pub struct SharedDbEntityMap {
 }
 
 impl SharedDbEntityMap {
-    fn read(&self) -> RwLockReadGuard<DbEntityMap> {
+    pub fn read(&self) -> RwLockReadGuard<DbEntityMap> {
         self.inner.read().unwrap()
     }
-    fn write(&self) -> RwLockWriteGuard<DbEntityMap> {
+    pub fn write(&self) -> RwLockWriteGuard<DbEntityMap> {
         self.inner.write().unwrap()
     }
 }
 
 #[allow(dead_code)]
 #[derive(Resource, Default, Debug)]
-struct DbEntityMap {
-    world_to_db: EntityHashMap<Entity>,
-    db_to_world: EntityHashMap<Entity>,
+pub struct DbEntityMap {
+    pub(crate) world_to_db: EntityHashMap<Entity>,
+    pub(crate) db_to_world: EntityHashMap<Entity>,
 }
 
 #[allow(dead_code)]
 impl DbEntityMap {
-    fn db_entity(&self, world_entity: Entity) -> Option<DbEntity> {
-        self.world_to_db.get(&world_entity).copied().map(DbEntity)
+    pub(crate) fn new_mapped_entities(&mut self) -> Vec<(DbEntity, Entity)> {
+        let mut out = vec![];
+        for (db_entity, world_entity) in self.db_to_world.iter().map(|(k, v)| (*k, *v)) {
+            if self.world_to_db.insert(world_entity, db_entity).is_none() {
+                out.push((DbEntity(db_entity), world_entity));
+            }
+        }
+        out
     }
 
-    fn world_entity(&self, db_entity: DbEntity) -> Option<Entity> {
-        self.db_to_world.get(&db_entity.0).copied()
+    pub fn db_entity(&self, world_entity: Entity) -> Option<DbEntity> {
+        let res = self.world_to_db.get(&world_entity).copied().map(DbEntity);
+        res
     }
 
-    fn add_db_mapping(&mut self, db_entity: DbEntity, world_entity: Entity) {
-        debug!(?world_entity, ?db_entity, "adding mapping");
-        self.db_to_world.insert(db_entity.0, world_entity);
-        self.world_to_db.insert(world_entity, db_entity.0);
+    pub fn world_entity(&self, DbEntity(db_entity): DbEntity) -> Option<Entity> {
+        let res = self.db_to_world.get(&db_entity).copied();
+        trace!(world_entity=?res, ?db_entity, "map world_entity");
+        res
     }
 
-    fn remove_db_mapping(&mut self, world_entity: Entity) {
+    pub fn add_db_mapping(
+        &mut self,
+        DbEntity(db_entity): DbEntity,
+        world_entity: Entity,
+    ) -> Option<Entity> {
+        let prev = self.db_to_world.insert(db_entity, world_entity);
+        self.world_to_db.insert(world_entity, db_entity);
+
+        // Make sure we clear the world -> db mapping so that the new one won't
+        // be erroneously removed by remove_db_mapping.
+        if let Some(prev) = prev {
+            self.world_to_db.remove(&prev);
+        }
+
+        prev
+    }
+
+    pub fn remove_db_mapping(&mut self, world_entity: Entity) -> Option<DbEntity> {
         if let Some(db_entity) = self.world_to_db.remove(&world_entity) {
-            debug!(?world_entity, ?db_entity, "removing mapping");
+            debug!(?db_entity, ?world_entity, "remove_db_mapping");
             self.db_to_world.remove(&db_entity);
+            Some(DbEntity(db_entity))
+        } else {
+            None
         }
-    }
-
-    // After entities are loaded from the db, we need to update the reverse
-    // mappings.
-    fn update(&mut self) {
-        self.db_to_world.iter().for_each(|(f, t)| {
-            self.world_to_db.insert(*t, *f);
-        })
     }
 }
 
-pub struct DynamicDbEntity {
-    entity: DbEntity,
-    parent: Option<DbEntity>,
-    components: Vec<Box<dyn Reflect>>,
-}
-
-async fn fetch_entity(
-    conn: &mut SqliteConnection,
-    entity: DbEntity,
-) -> Result<SerializedComponents<'static>, sqlx::Error> {
-    debug!(?entity, "fetching entity");
-    let conn = conn.acquire().await?;
-
-    let id = entity.to_index();
-
-    let mut results = sqlx::query!(
-        r#"
-      select c.name, ec.data
-      from entity_component ec
-      inner join component c
-      on ec.component = c.id
-      where ec.entity = ?
-    "#,
-        id,
-    )
-    .fetch(conn);
-
-    let mut components = SerializedComponents::default();
-
-    while let Some(a) = results.next().await.transpose()? {
-        components.insert(Cow::Owned(a.name), a.data);
+impl DbWorld {
+    pub fn write(&self) -> RwLockWriteGuard<World> {
+        self.0.write().unwrap()
     }
-
-    Ok(components)
-}
-
-async fn store_entity(
-    conn: &mut SqliteConnection,
-    entity: impl Into<Option<DbEntity>>,
-    parent: impl Into<Option<DbEntity>>,
-    components: &SerializedComponents<'_>,
-) -> Result<DbEntity, sqlx::Error> {
-    let parent_id = parent.into().map(|p| p.to_index());
-    let entity_id = match entity.into() {
-        Some(entity) => {
-            let id = entity.to_index();
-            // Make sure the entity exists and that the existing state is cleared.
-            sqlx::query!(
-                r#"
-          delete from entity_component where entity = ?;
-          insert into entity (id, parent) values (?, ?)
-          on conflict do update set parent = excluded.parent;
-        "#,
-                id,
-                id,
-                parent_id,
-            )
-            .execute(&mut *conn)
-            .await?;
-            entity
-        }
-        None => DbEntity::from_index(
-            sqlx::query!(
-                "INSERT INTO entity (parent) values (?) returning id",
-                parent_id,
-            )
-            .fetch_one(&mut *conn)
-            .await?
-            .id as _,
-        ),
-    };
-
-    for (name, value) in components.iter() {
-        let entity_bits = entity_id.to_index() as i64;
-        sqlx::query!(
-            r#"
-        insert or ignore into component (name) values (?);
-        insert into entity_component (entity, component, data)
-        values (?, (select id from component where name = ?), ?);
-      "#,
-            name,
-            entity_bits,
-            name,
-            value,
-        )
-        .execute(&mut *conn)
-        .await?;
-    }
-
-    Ok(entity_id)
-}
-
-#[allow(dead_code)]
-async fn delete_entity(conn: &mut SqliteConnection, entity: DbEntity) -> Result<(), sqlx::Error> {
-    let id = entity.to_index();
-
-    sqlx::query!(
-        r#"
-      delete from entity where id = ?;
-    "#,
-        id,
-    )
-    .execute(conn)
-    .await?;
-
-    Ok(())
-}
-
-fn find_parent(c: Box<dyn Reflect>) -> Either<Entity, Box<dyn Reflect>> {
-    if c.represents::<Parent>() {
-        Either::Left(
-            c.downcast::<DynamicTupleStruct>()
-                .unwrap()
-                .field(0)
-                .unwrap()
-                .downcast_ref::<Entity>()
-                .copied()
-                .unwrap(),
-        )
-    } else {
-        Either::Right(c)
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[derive(Default, Reflect, Component)]
-    #[reflect(Component)]
-    pub struct MyComponent(usize);
-
-    fn test_entities<'a>(
-        entities: &'a [(i64, &'a [(&'a str, &'a str)])],
-    ) -> SerializedEntities<'a> {
-        entities
-            .iter()
-            .map(|(id, components)| {
-                (
-                    DbEntity::from_index(*id),
-                    components
-                        .iter()
-                        .map(|(name, value)| (Cow::Borrowed(*name), value.to_string()))
-                        .collect(),
-                )
-            })
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn test_store_fetch() -> Result<(), BoxError> {
-        let db = SqlitePool::connect_lazy("sqlite::memory:")?;
-
-        sqlx::query(include_str!("../../schema.sql"))
-            .execute(&db)
-            .await?;
-
-        let mut conn = db.acquire().await?;
-
-        let mut entities = test_entities(&[
-            (2, &[("foo", "bar")]),
-            (8, &[("foo", "baz"), ("spam", "eggs")]),
-        ]);
-
-        for (entity, components) in entities.iter_mut() {
-            store_entity(&mut conn, *entity, None, components).await?;
-        }
-
-        println!("entity:");
-        let mut results = sqlx::query!("select * from entity",).fetch(&db);
-        while let Some(row) = results.next().await.transpose()? {
-            println!("\t{:?}", row);
-        }
-        println!("component:");
-        let mut results = sqlx::query!("select * from component",).fetch(&db);
-        while let Some(row) = results.next().await.transpose()? {
-            println!("\t{:?}", row);
-        }
-        println!("entity_component:");
-        let mut results = sqlx::query!("select * from entity_component",).fetch(&db);
-        while let Some(row) = results.next().await.transpose()? {
-            println!("\t{:?}", row);
-        }
-
-        let mut conn = db.acquire().await?;
-        let entity = fetch_entity(&mut conn, DbEntity::from_index(8)).await?;
-        println!("{:#?}", entity);
-
-        // panic!();
-        Ok(())
+    pub fn read(&self) -> RwLockReadGuard<World> {
+        self.0.read().unwrap()
     }
 }
