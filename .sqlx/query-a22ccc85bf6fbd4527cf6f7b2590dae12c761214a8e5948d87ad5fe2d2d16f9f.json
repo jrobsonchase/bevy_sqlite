@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "INSERT INTO entity (parent) values (?) returning id",
+  "query": "select id from entity",
   "describe": {
     "columns": [
       {
@@ -10,11 +10,11 @@
       }
     ],
     "parameters": {
-      "Right": 1
+      "Right": 0
     },
     "nullable": [
       false
     ]
   },
-  "hash": "f75c9164e96a9ac56a837f8e291dbd900f598d978fe7815ca74e417e53696e6b"
+  "hash": "a22ccc85bf6fbd4527cf6f7b2590dae12c761214a8e5948d87ad5fe2d2d16f9f"
 }

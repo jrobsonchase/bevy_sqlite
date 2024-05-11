@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n      select c.name, ec.data\n      from entity_component ec\n      inner join component c\n      on ec.component = c.id\n      where ec.entity = ?\n    ",
+  "query": "\n                    SELECT c.name, ec.data\n                    FROM component c, entity_component ec\n                    WHERE ec.component = c.id\n                    AND ec.entity = ?\n                ",
   "describe": {
     "columns": [
       {
@@ -22,5 +22,5 @@
       false
     ]
   },
-  "hash": "daa3ceb9a67e66b7591de47e7784e9f34f939a3177b8e286fc6034c16e55847f"
+  "hash": "ddd72482098706680efc4d5e625c75ba876a9cea5c236be1914e02c82628831e"
 }
